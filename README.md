@@ -8,4 +8,3 @@ modified during: May - August 2016
 
 Description:
 A ROS based package. My task was to do path recognization from bottom camera of the robot. 
-
