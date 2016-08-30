@@ -1,0 +1,186 @@
+/*
+ * Author: James
+ */
+
+#ifndef HEADING_CONTROL_H
+#define HEADING_CONTROL_H
+
+#include <stdio.h>
+#include <numeric>
+#include <vector>
+#include <ros/ros.h>
+#include <geometry_msgs/Vector3.h>
+#include <au_core/MCDiff.h>
+#include <signal.h>
+
+namespace hc {
+
+const int HEADING_BUFFER = 1;
+const double REFRESH_RATE = 20; //In Hz
+const int STABLE_SPEED = 3; //In degrees per second
+const int I_MAX = 100;
+const int I_MIN = -100;
+const float P_GAIN = 0.2;
+const float I_GAIN = 0.2;
+
+class HeadingControl {
+
+	private:
+		ros::NodeHandle nh_;
+		ros::Rate rate_;
+		ros::Subscriber target_sub_;
+		ros::Subscriber heading_sub_;
+		ros::Publisher motor_pub_;
+		ros::Publisher test_pub_;
+
+		int current_heading_;
+		float speed_;
+		
+		int target_;
+		int diff_;
+		ros::Time ts_;
+		std::vector<float> speed_vec_;
+		float i_state_;
+
+		void setHeading(const geometry_msgs::Vector3::ConstPtr& heading_vec);
+		void targetAngle(const geometry_msgs::Vector3::ConstPtr& angle_vec);
+		bool hitTarget();
+		void adjustEffort();
+		static void quit_handler(int s) {
+			std::cout << "\nClosing heading control..." << std::endl;
+			exit(1);
+		};
+
+	public:
+		HeadingControl();
+		void lockHeading();
+		int getHeadingDifferential(const int current, const int target);
+};
+
+HeadingControl::HeadingControl(): 
+	rate_(REFRESH_RATE), current_heading_(0), speed_(0), target_(0), diff_(0), ts_(ros::Time::now()), i_state_(0)
+{
+	target_sub_ = nh_.subscribe("/path_angle", 1, &HeadingControl::targetAngle, this);
+	heading_sub_ = nh_.subscribe("/os5000/euler", 1, &HeadingControl::setHeading, this);
+	motor_pub_ = nh_.advertise<au_core::MCDiff>("/motor/hor/differential", 20);
+	//test_pub_ = nh_.advertise<geometry_msgs::Vector3>("/path_angle", 1);
+
+	//Ctrl+C handler
+	struct sigaction sigIntHandler;
+
+	sigIntHandler.sa_handler = quit_handler;
+	sigemptyset(&sigIntHandler.sa_mask);
+	sigIntHandler.sa_flags = 0;
+
+	sigaction(SIGINT, &sigIntHandler, NULL);
+
+	/*std::cout << "Running and publishing" << std::endl;
+	geometry_msgs::Vector3 msg;
+	msg.x = 50.0; msg.y = 0.0; msg.z = 0.0;
+	test_pub_.publish(msg);*/
+
+	std::cout << "Running heading lock" << std::endl;
+	lockHeading();
+}
+
+void HeadingControl::lockHeading() 
+{
+	while (true) {
+
+		ros::spinOnce();
+
+		if (hitTarget() && speed_ < STABLE_SPEED) {
+			std::printf("Locked on target: %3i\n", target_);
+
+			//Publish 0 effort
+			au_core::MCDiff null_diff;
+			null_diff.header.stamp = ros::Time::now();
+			null_diff.differential = 0;
+
+			motor_pub_.publish(null_diff);
+		}
+		else {
+			adjustEffort();
+		}
+
+		rate_.sleep();
+	}
+}
+
+void HeadingControl::setHeading(const geometry_msgs::Vector3::ConstPtr& heading_vec)
+{
+	float last_diff = diff_;
+	ros::Time last_ts = ts_;
+
+	current_heading_ = heading_vec->z;
+	ts_ = ros::Time::now();
+	diff_ = getHeadingDifferential(current_heading_, target_);
+
+	//Set speed
+	float inst_speed = std::abs(diff_ - last_diff) / (ts_ - last_ts).toSec();
+	speed_vec_.push_back(inst_speed);
+
+	//Deletes any data older than a second (as long as data continues to be published)
+	if (speed_vec_.size() > 20)
+		speed_vec_.erase(speed_vec_.begin());
+
+	if(speed_vec_.size() > 0)
+		speed_ = std::accumulate(speed_vec_.begin(), speed_vec_.end(), 0.0) / speed_vec_.size();
+}
+
+void HeadingControl::targetAngle(const geometry_msgs::Vector3::ConstPtr& angle_vec)
+{
+	int angle = (int) angle_vec->x;
+	if (angle < 0) {
+		angle = 360 + angle;
+	}
+
+	target_ = (current_heading_ + angle) % 360;
+	//std::printf("Message received: targetting heading %i\n", target_);
+}
+
+bool HeadingControl::hitTarget() 
+{
+	//Success if current heading is target +- HEADING_BUFFER degrees
+	return current_heading_ <= target_ + HEADING_BUFFER && current_heading_ >= target_ - HEADING_BUFFER;
+}
+
+int HeadingControl::getHeadingDifferential(const int current, const int target)
+{	
+	int a = target - current;
+	
+	if(a > 180) {
+		a = -360 + a;
+	}
+	else if (a < -180) {
+		a = 360 + a;
+	}
+
+	return a;
+} 
+
+void HeadingControl::adjustEffort() 
+{
+	//Proportional
+	float p_term = P_GAIN * diff_;
+
+	i_state_ += diff_;
+	if (i_state_ > I_MAX)
+		i_state_ = I_MAX;
+	else if (i_state_ < I_MIN)
+		i_state_ = I_MIN;
+	
+	float i_term = I_GAIN * i_state_;
+	float effort = p_term + i_term;
+
+	std::printf("Current: %i Diff: %i Target: %i Speed: %3.2f Effort: %3.2f\n", current_heading_, diff_, target_, speed_, effort);
+
+	au_core::MCDiff mc_diff;
+	mc_diff.header.stamp = ros::Time::now();
+	mc_diff.differential = effort;
+
+	motor_pub_.publish(mc_diff);
+}
+
+}
+#endif
